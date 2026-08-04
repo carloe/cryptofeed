@@ -74,8 +74,8 @@ all = [
 [project.urls]
 Homepage = "https://github.com/bmoscon/cryptofeed"
 
-[tool.setuptools]
-packages = ["cryptofeed"]
+[tool.setuptools.packages.find]
+include = ["cryptofeed*"]
 
 [tool.setuptools.package-data]
 cryptofeed = ["*.pyx"]
