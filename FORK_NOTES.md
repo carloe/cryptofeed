@@ -19,6 +19,7 @@ reformatted, or modernized. See `CLAUDE.md` for the full working rules.
 | 2026-08-04 | `0ea4d9ba` | `CLAUDE.md`, `FORK_NOTES.md` | Fork maintenance docs. New files, no upstream code touched. |
 | 2026-08-04 | `79b70972` | `cryptofeed/exchanges/bybit.py` | [Migrate `LIQUIDATIONS` to the `allLiquidation` topic](#1-bybit-liquidations-allliquidation-migration). Includes two deliberate behavior changes: [timestamp units](#11-behavior-change-timestamp-units) and [side mapping](#12-behavior-change-side-mapping-inverted), plus a [minor `raw` scope change](#13-minor-raw-payload-scope). |
 | 2026-08-04 | `111e3955` | `tests/unit/test_bybit.py`, `examples/demo_bybit_all_liquidation.py` | Test coverage and a live smoke script for the above. New files, no upstream code touched. |
+| 2026-08-04 | `ab6d776c` | `pyproject.toml` | [Ship the `cryptofeed` subpackages in source builds](#2-packaging-subpackages-excluded-from-source-builds). Inherited upstream defect; the only change to a build file, made under [strict necessity](#22-why-a-build-file-was-touched). |
 
 ## Details
 
@@ -94,3 +95,86 @@ it looks wrong but is right.
 Upstream attached the whole message envelope (`raw=msg`). Since `allLiquidation` batches events, the
 parser now emits one `Liquidation` per element with `raw=entry`, matching how `_trade` and `_candle`
 handle list payloads. Attaching the full batch to each of N objects would be misleading.
+
+### 2. Packaging: subpackages excluded from source builds
+
+Upstream's `pyproject.toml` declared:
+
+```toml
+[tool.setuptools]
+packages = ["cryptofeed"]
+```
+
+That is an explicit, non-recursive package list. It names exactly one package, so `cryptofeed.exchanges`,
+`cryptofeed.backends` and `cryptofeed.util` were excluded from every wheel built from source. The failure is
+total rather than partial: `cryptofeed/__init__.py` imports `FeedHandler`, and `cryptofeed/feedhandler.py`
+imports `EXCHANGE_MAP` from `cryptofeed.exchanges`, so even a bare `import cryptofeed` raises
+`ModuleNotFoundError: No module named 'cryptofeed.exchanges'`.
+
+Replaced with a recursive find directive:
+
+```toml
+[tool.setuptools.packages.find]
+include = ["cryptofeed*"]
+```
+
+Nothing else in the file was altered. No second package declaration exists anywhere that could reintroduce
+this: `setup.py` carries only the Cython `ext_modules`, `MANIFEST.in` governs sdist file inclusion only, and
+there is no `setup.cfg`.
+
+#### 2.1 The defect is inherited, not introduced here
+
+It predates the fork point. Upstream commit `de2f69a2` ("Move to pyproject.toml file for uv", 2026-01-31)
+migrated packaging metadata out of `setup.py` and, in doing so, replaced `setup.py`'s `find_packages()` call
+with the hand-written one-element list above. That commit is six commits before the fork point `fe5993b0`.
+At the fork point, and up to this change, `git diff fe5993b0 -- pyproject.toml` was empty — the fork had
+never touched the file.
+
+Upstream's *published* artifacts never exhibited this. `v2.4.1` was released to PyPI on 2025-02-08, built
+from a tree where packaging was still driven by `setup.py`'s `find_packages()`; the published
+`cryptofeed-2.4.1-*.whl` files therefore contain all 90 modules. The `pyproject.toml` migration landed
+almost a year later, on 2026-01-31, and upstream was archived on 2026-07-08 without ever cutting a release
+from the migrated tree. No published artifact was ever built from the broken declaration, which is why the
+defect sat unnoticed on `master`. (`build-wheels.sh` runs `pip wheel /io/`, which honors `pyproject.toml`;
+it would not have masked the defect had it been run — it simply never was, post-migration.)
+
+A git-dependency install has no such luck. `uv`/`pip` installing `cryptofeed @ git+https://…@<ref>` clones
+the ref and runs a PEP 517 source build against exactly this `pyproject.toml`, so the consumer gets the
+truncated wheel. That is the only way this fork is ever installed.
+
+#### 2.2 Why a build file was touched
+
+`CLAUDE.md` says to leave the build alone. This is the exception it allows for: *what a change strictly
+requires*. The fork's sole purpose is to be installed as a pinned git dependency, and without this the
+package does not import at all — there is no smaller change that yields a working install, and no
+source-side workaround, because the defect is in the packaging declaration itself. The delta is two lines in
+one declaration.
+
+Verified by wheel manifest rather than by import alone. Built from the fixed tree, `RECORD` lists 99 entries
+against the published `cryptofeed-2.4.1-cp313-cp313-macosx_11_0_arm64.whl`'s 97 (23 before the fix). The
+sets of `.py` modules are identical in both directions — 90 each, zero difference. The four remaining
+entries are all accounted for: `AUTHORS.md` and `LICENSE` moved from `*.dist-info/` to
+`*.dist-info/licenses/`, which is a setuptools ≥ 77 relocation, not a content change; and `types.c` and
+`types.pyx` are extra, both of which the *unfixed* build also produced, so neither is attributable to this
+change (`types.pyx` comes from upstream's `[tool.setuptools.package-data]`, which did not exist at
+`v2.4.1`; `types.c` is generated in-tree by `cythonize` during the build). Every non-`.py` data file
+upstream ships is present.
+
+#### 2.3 Source builds require setuptools >= 77
+
+Recorded here as pre-existing documentation debt, not a new finding, and not changed by the above.
+
+Upstream's `pyproject.toml` sets `license = "XFree86-1.1"` — a PEP 639 SPDX license *expression*. Support
+for the string form landed in setuptools 77.0.0. Older setuptools accepts only the `{file = …}` or
+`{text = …}` table forms and rejects the string during metadata generation:
+
+```
+ValueError: invalid pyproject.toml config: `project.license`.
+configuration error: `project.license` must be valid exactly by one definition (2 matches found)
+```
+
+The `[build-system] requires` pin is the unversioned `"setuptools"`, so under PEP 517 build isolation — how
+`uv` and `pip` build by default, including for git dependencies — a current setuptools is fetched and this
+is satisfied automatically. Only a deliberate `--no-build-isolation` build against a pre-77 setuptools in
+the ambient environment will fail. The `requires` pin is left alone rather than tightened, per minimal-delta
+discipline; this note exists so the failure mode is recognizable if anyone hits it.
