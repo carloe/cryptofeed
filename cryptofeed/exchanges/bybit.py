@@ -35,7 +35,7 @@ class Bybit(Feed):
         OPEN_INTEREST: 'open_interest',
         FUNDING: 'funding',
         CANDLES: 'kline',
-        LIQUIDATIONS: 'liquidation',
+        LIQUIDATIONS: 'allLiquidation',
         TICKER: 'tickers'
     }
     websocket_endpoints = [
@@ -184,30 +184,40 @@ class Bybit(Feed):
     async def _liquidation(self, msg: dict, timestamp: float):
         '''
         {
-            "topic": "liquidation.BTCUSDT",
+            "topic": "allLiquidation.ROSEUSDT",
             "type": "snapshot",
-            "ts": 1703485237953,
-            "data": {
-                "updatedTime": 1703485237953,
-                "symbol": "BTCUSDT",
-                "side": "Sell",
-                "size": "0.003",
-                "price": "43511.70"
-            }
+            "ts": 1739502303204,
+            "data": [
+                {
+                    "T": 1739502302929,
+                    "s": "ROSEUSDT",
+                    "S": "Sell",
+                    "v": "20000",
+                    "p": "0.04499"
+                }
+            ]
         }
         '''
-        liq = Liquidation(
-            self.id,
-            self.exchange_symbol_to_std_symbol(msg['data']['symbol']),
-            BUY if msg['data']['side'] == 'Buy' else SELL,
-            Decimal(msg['data']['size']),
-            Decimal(msg['data']['price']),
-            None,
-            None,
-            msg['ts'],
-            raw=msg
-        )
-        await self.callback(LIQUIDATIONS, liq, timestamp)
+        for entry in msg['data']:
+            # Bybit documents S as the *position* side: "When you receive a Buy update,
+            # this means that a long position has been liquidated"
+            # (https://bybit-exchange.github.io/docs/v5/websocket/public/all-liquidation).
+            # Everywhere else in cryptofeed, Liquidation.side is the side of the forced
+            # order that closed the position - Binance, OKX, BitMEX and Deribit all emit
+            # SELL when a long is liquidated. The mapping is inverted here to match that
+            # convention, so a Bybit 'Buy' (long liquidated) is reported as SELL.
+            liq = Liquidation(
+                self.id,
+                self.exchange_symbol_to_std_symbol(entry['s']),
+                SELL if entry['S'] == 'Buy' else BUY,
+                Decimal(entry['v']),
+                Decimal(entry['p']),
+                None,
+                None,
+                self.timestamp_normalize(int(entry['T'])),
+                raw=entry
+            )
+            await self.callback(LIQUIDATIONS, liq, timestamp)
 
     async def message_handler(self, msg: str, conn, timestamp: float):
 
@@ -235,7 +245,7 @@ class Bybit(Feed):
             await self._book(msg, timestamp, market)
         elif msg['topic'].startswith('kline'):
             await self._candle(msg, timestamp, market)
-        elif msg['topic'].startswith('liquidation'):
+        elif msg['topic'].startswith('allLiquidation'):
             await self._liquidation(msg, timestamp)
         elif msg['topic'].startswith('tickers'):
             await self._ticker_open_interest_funding_index(msg, timestamp, conn)
