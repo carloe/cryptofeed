@@ -79,7 +79,23 @@ def get_message_count(filenames: str):
     return counter
 
 
-@pytest.mark.parametrize("exchange", [e for e in EXCHANGE_MAP.keys() if e not in [EXX]])
+# KRAKEN_FUTURES is a known and intended failure, not a regression. Its sample_data seeds
+# the symbol map from a REST response recorded in 2021, when Kraken returned lowercase
+# symbols, then replays websocket frames carrying uppercase product_ids - a pairing that
+# resolves only if the code lowercases the wire value. Kraken's REST endpoint now returns
+# uppercase and this fork stopped lowercasing to match (see FORK_NOTES section 4, "Kraken
+# Futures websocket product_id case drift"), so the fixture pins a contract that no longer
+# exists. It fails on FI_BCHUSD_210730, a fixed maturity contract that expired 2021-07-30.
+#
+# Re-recording sample_data is the only proper fix; making the symbol lookup case
+# insensitive would keep this green precisely by masking the drift the fork exists to
+# catch. strict=True is deliberate - if the fixtures are ever re-recorded, this marker
+# starts failing and tells you to delete it.
+@pytest.mark.parametrize("exchange", [
+    pytest.param(e, marks=pytest.mark.xfail(strict=True, reason="2021 fixture pins the pre-drift lowercase REST symbols, see FORK_NOTES 4.5"))
+    if e == KRAKEN_FUTURES else e
+    for e in EXCHANGE_MAP.keys() if e not in [EXX]
+])
 def test_exchange_playback(exchange):
     Symbols.clear()
     dir = os.path.dirname(os.path.realpath(__file__))
