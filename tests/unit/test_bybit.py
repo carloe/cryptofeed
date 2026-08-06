@@ -28,9 +28,11 @@ def seeded_symbols():
     previous = Symbols.data.get(BYBIT)
 
     Symbols.set(BYBIT,
-                {'BTC-USDT-PERP': 'BTCUSDT', 'ETH-USDT-PERP': 'ETHUSDT'},
-                {'tick_size': {'BTC-USDT-PERP': Decimal('0.1'), 'ETH-USDT-PERP': Decimal('0.01')},
-                 'instrument_type': {'BTC-USDT-PERP': PERPETUAL, 'ETH-USDT-PERP': PERPETUAL}})
+                {'BTC-USDT-PERP': 'BTCUSDT', 'ETH-USDT-PERP': 'ETHUSDT', 'POPCAT-USDT-PERP': 'POPCATUSDT'},
+                {'tick_size': {'BTC-USDT-PERP': Decimal('0.1'), 'ETH-USDT-PERP': Decimal('0.01'),
+                               'POPCAT-USDT-PERP': Decimal('0.00001')},
+                 'instrument_type': {'BTC-USDT-PERP': PERPETUAL, 'ETH-USDT-PERP': PERPETUAL,
+                                     'POPCAT-USDT-PERP': PERPETUAL}})
 
     yield
 
@@ -61,6 +63,47 @@ def make_feed():
 
     feed = Bybit(symbols=['BTC-USDT-PERP', 'ETH-USDT-PERP'], channels=[LIQUIDATIONS], callbacks={LIQUIDATIONS: callback})
     return feed, liquidations
+
+
+# A real frame recorded off the Bybit linear websocket on 2026-08-05, captured before
+# parsing and never re-serialized, so it is byte for byte what the exchange sent. Every
+# other fixture in this file is hand written from Bybit's documentation - this one is
+# the only evidence of what the wire actually carries. Do not reformat or prettify it.
+RECORDED_FRAME_2026_08_05 = '{"topic":"allLiquidation.POPCATUSDT","type":"snapshot","ts":1785905987246,"data":[{"T":1785905986808,"s":"POPCATUSDT","S":"Buy","v":"16322","p":"0.04418"}]}'
+
+
+def test_liquidation_recorded_frame():
+    '''
+    Full parsed surface of a recorded frame, fed in as the raw string so that routing
+    and deserialization run exactly as they did live.
+
+    This fixture exists to pin the fork's two deliberate deltas against upstream
+    (FORK_NOTES sections 1.1 and 1.2) to real exchange output rather than to a reading
+    of the docs.
+    '''
+    feed, liquidations = make_feed()
+
+    asyncio.run(feed.message_handler(RECORDED_FRAME_2026_08_05, MockConnection(), 1785905987.5))
+
+    assert len(liquidations) == 1
+    liq = liquidations[0]
+    assert liq.exchange == BYBIT
+    assert liq.symbol == 'POPCAT-USDT-PERP'
+    # S is 'Buy', the *position* side, so a long was liquidated - and a long is closed
+    # by a sell. Liquidation.side is the forced order side, hence SELL. FORK_NOTES 1.2.
+    # A verbatim upstream style mapping would emit BUY here.
+    assert liq.side == SELL
+    assert liq.quantity == Decimal('16322')
+    assert liq.price == Decimal('0.04418')
+    # The event's own T (1785905986808) and the batch envelope ts (1785905987246) differ
+    # by 438ms in this frame, which is the whole point of recording it - a fixture where
+    # the two matched could not tell an envelope/event mixup from correct behavior.
+    # Float seconds from T, per FORK_NOTES 1.1.
+    assert isinstance(liq.timestamp, float)
+    assert liq.timestamp == 1785905986.808
+    assert liq.timestamp != 1785905987.246
+    # raw is the individual event, not the enclosing batch
+    assert liq.raw == {"T": 1785905986808, "s": "POPCATUSDT", "S": "Buy", "v": "16322", "p": "0.04418"}
 
 
 def test_liquidation_single_event():
