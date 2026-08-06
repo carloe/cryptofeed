@@ -35,6 +35,8 @@ this fork's. To see only the fork's delta, diff against `fe5993b0`.
 | 2026-08-04 | `111e3955` | `tests/unit/test_bybit.py`, `examples/demo_bybit_all_liquidation.py` | Test coverage and a live smoke script for the above. New files, no upstream code touched. |
 | 2026-08-04 | `ab6d776c` | `pyproject.toml` | [Ship the `cryptofeed` subpackages in source builds](#2-packaging-subpackages-excluded-from-source-builds). Inherited upstream defect; the only change to a build file, made under [strict necessity](#22-why-a-build-file-was-touched). |
 | 2026-08-06 | `6b8b6a91` | `tests/unit/test_bybit.py` | [Pin the liquidation deltas to a recorded `allLiquidation` frame](#3-recorded-allliquidation-fixture). Test only, no behavior change. |
+| 2026-08-06 | `91320542` | `cryptofeed/exchanges/kraken_futures.py` | [Stop lowercasing the websocket `product_id` at the dispatch point](#4-kraken-futures-websocket-product_id-case-drift). Kraken's REST instruments endpoint now returns uppercase symbols, so the transform broke every inbound message. Includes a [known test consequence](#45-known-consequence-test_exchange_playbackkraken_futures-now-fails). |
+| 2026-08-06 | `2eb24a8a` | `tests/unit/test_kraken_futures.py` | Recorded-capture coverage for the above. New file, no upstream code touched. |
 
 ## Details
 
@@ -220,3 +222,171 @@ The parser was restored immediately; no upstream source file was modified by thi
 The capture came from a 30-minute live run by the downstream `litquid` collector on 2026-08-05, which
 recorded 35 `allLiquidation` events across 55 symbols, all of which reconciled to correctly parsed rows.
 One representative frame is vendored here; the fork does not carry the capture set.
+
+### 4. Kraken Futures websocket `product_id` case drift
+
+`KRAKEN_FUTURES` was **entirely non-functional** in this fork before this change — not degraded on one
+channel, dead on all of them. `message_handler` has a single dispatch point that resolves the symbol
+before routing to any parser:
+
+```python
+# As per Kraken support: websocket product_id is uppercase version of the REST API symbols
+pair = self.exchange_symbol_to_std_symbol(msg['product_id'].lower())
+```
+
+Every inbound message — trades, `ticker_lite`, `ticker` (which drives both funding and open interest),
+`book` and `book_snapshot` — passes through that one line, so a failing lookup takes out the whole
+exchange. It raised `UnsupportedSymbol` on every message.
+
+The `.lower()` is now removed; the wire value is used verbatim. The comment above it, which documented
+the assumption that no longer holds, was corrected in the same two-line change. Nothing else in the file
+was touched.
+
+#### 4.1 The assumption was true when written, and Kraken changed it
+
+This is exchange-API drift, not an upstream mistake. The repo contains the proof at both ends of the
+timeline, because upstream's own playback fixture is a 2021 capture of *both* sides of the API:
+
+| | REST `/derivatives/api/v3/instruments` `symbol` | Websocket `product_id` |
+| --- | --- | --- |
+| `sample_data/KRAKEN_FUTURES.0`, captured 2021-07-22 | `pi_xbtusd` (27/27 lowercase) | `FI_XBTUSD_210730` (uppercase) |
+| Live, fetched 2026-08-06 | `PI_XBTUSD` (298/298 uppercase, 0 lowercase) | `PF_XBTUSD` (uppercase) |
+
+In 2021 the REST endpoint returned lowercase and the websocket returned uppercase, so lowercasing the
+wire value was exactly right and the comment was accurate. Kraken has since changed the REST instruments
+endpoint to return uppercase. The websocket never changed. The two sides now agree verbatim, and the
+transform is what breaks them apart.
+
+#### 4.2 Evidence: the wire value and the map keys, verbatim
+
+The reverse map is built in `Exchange.__init__` as `{value: key for key, value in
+normalized_symbol_mapping.items()}`, and `_parse_symbol_data` stores `ret[s.normalized] =
+entry['symbol']` — the REST string **untransformed**. So the map keys are whatever case Kraken's REST
+returns.
+
+Captured 2026-08-06 off `wss://futures.kraken.com/ws/v1`, subscribed to `PF_XBTUSD`, 27449 frames in
+60 seconds. The only `product_id` value that appeared, across all 27444 data frames:
+
+```
+'PF_XBTUSD'  x27444
+```
+
+The reverse symbol map built from the live REST endpoint, 288 entries, first few:
+
+```
+'PF_XBTUSD' -> 'BTC-USD-PERP'
+'PF_ETHUSD' -> 'ETH-USD-PERP'
+'PF_LTCUSD' -> 'LTC-USD-PERP'
+```
+
+288 of 288 keys contain an uppercase character; 0 contain a lowercase character. `'PF_XBTUSD' in map`
+is `True`, `'pf_xbtusd' in map` is `False`. The two agree exactly, in verbatim uppercase — there is no
+prefix or separator difference, so removing the transform is the whole fix and nothing more is needed.
+
+Reproduced against a recorded trade frame before fixing:
+
+```
+cryptofeed/exchanges/kraken_futures.py:250, in message_handler
+    pair = self.exchange_symbol_to_std_symbol(msg['product_id'].lower())
+cryptofeed.exceptions.UnsupportedSymbol: pf_xbtusd is not supported on KRAKEN_FUTURES
+```
+
+#### 4.3 Audit: every case transform in the file
+
+The file contains exactly two, and only one is a defect. Both are listed because the assumption behind
+the broken one could plausibly recur:
+
+| Line | Site | Transform | Verdict |
+| --- | --- | --- | --- |
+| 61 | `_parse_symbol_data` | `entry['symbol'].upper().split("_", maxsplit=1)` | **Harmless, left alone.** |
+| 250 | `message_handler` dispatch | `msg['product_id'].lower()` | **The defect. Removed.** |
+
+Line 61 is safe for two independent reasons. It is currently a no-op — all 298 live REST symbols are
+already uppercase — and, more importantly, its result is used *only* to derive the parsed pieces
+(`ftype`, `base`, `quote`, `expiry`). The value actually stored in the map is `entry['symbol']`,
+the original untransformed string, so line 61 cannot affect a map key no matter what Kraken returns.
+Verified: every stored map value appears verbatim in the REST response, and none differs from its
+source by case. It is also load-bearing for the `_kraken_futures_product_type[ftype]` lookup, whose
+keys are uppercase, so it is left exactly as it is.
+
+For completeness, the outbound path applies no transform at all: `subscribe` sends
+`self.subscription[chan]`, which `Feed` populates via `std_symbol_to_exchange_symbol` — again the
+verbatim REST string. It emits `product_ids: ['PF_XBTUSD']`, which the exchange accepts. Outbound was
+therefore always correct; only inbound applied a transform, and the two paths disagreed. They now agree.
+
+No other file was audited or changed under this entry.
+
+#### 4.4 How it surfaced
+
+The downstream `litquid` collector ran `KRAKEN_FUTURES` and recorded **zero parsed events** alongside a
+reconnect storm consuming **6.41 GB/day**. The failure mode is self-sustaining: `UnsupportedSymbol`
+escapes `message_handler`, kills the connection handler, the feed reconnects, replays a `book_snapshot`,
+and raises again on the first message. Bandwidth is consumed at full rate while nothing is ever parsed.
+
+#### 4.5 Known consequence: `test_exchange_playback[KRAKEN_FUTURES]` now fails
+
+This test passed before the change and fails after it. It is **not** a pre-existing failure and is
+recorded here rather than papered over.
+
+`tests/unit/test_exchange.py::test_exchange_playback` replays `sample_data/KRAKEN_FUTURES.*`, which
+seeds the symbol map from the *recorded 2021 REST response* — the lowercase one in the table above —
+and then feeds it 2021 websocket frames carrying uppercase `product_id`s. That pairing only resolves if
+the code lowercases, so the fixture pins the pre-drift API contract by construction:
+
+```
+cryptofeed.exceptions.UnsupportedSymbol: FI_BCHUSD_210730 is not supported on KRAKEN_FUTURES
+Playback failed on message: {"feed":"book_snapshot","product_id":"FI_BCHUSD_210730", ...}
+```
+
+`FI_BCHUSD_210730` is a fixed-maturity contract that expired on 2021-07-30 and has not existed for five
+years. The test cannot pass against both the 2021 fixture and the 2026 exchange; passing it and working
+against live Kraken are mutually exclusive.
+
+It is left failing deliberately. Fixing it would mean re-recording upstream's `sample_data` capture and
+rewriting the `lookup_table` callback counts in `tests/unit/test_exchange.py` — a large delta to
+upstream test assets, well beyond this change, and it would amount to fabricating a new upstream
+fixture. Making the lookup case-insensitive instead was rejected for a different reason: it would keep
+the stale test green precisely by masking the class of drift this fork exists to detect.
+
+Aside from this one test, the fix introduces no other change in suite results — the before/after failure
+sets are otherwise identical.
+
+#### 4.6 Unrelated findings, reported but not changed
+
+Two pre-existing upstream defects were found while gathering the evidence above. Neither is touched.
+
+**`PI_XBTUSD` is not delisted, it is shadowed.** It is present and `tradeable: true` in the live REST
+response, but absent from the symbol map. `_parse_symbol_data` writes `ret[s.normalized]`, and
+`PI_XBTUSD` (inverse perp) and `PF_XBTUSD` (linear multi-collateral perp) both normalize to
+`BTC-USD-PERP`. Last write wins, so `PF_` overwrites `PI_`. Ten normalized symbols collide this way —
+298 tradeable instruments produce only 288 map entries:
+
+```
+BTC-USD-PERP  <- ['PI_XBTUSD', 'PF_XBTUSD']   (map keeps 'PF_XBTUSD')
+ETH-USD-PERP  <- ['PI_ETHUSD', 'PF_ETHUSD']   (map keeps 'PF_ETHUSD')
+BTC-USD-26U25 <- ['FF_XBTUSD_260925', 'FI_XBTUSD_260925']   (map keeps 'FI_XBTUSD_260925')
+```
+
+The inverse perpetuals and half the fixed-maturity contracts are therefore unreachable by normalized
+symbol. Fixing it requires a normalization scheme that distinguishes the product types, which changes
+public symbol names — far outside this change.
+
+**The book feed's exchange timestamp is discarded.** Kraken's book frames *do* carry a real exchange
+clock: all 27249 `book` frames in the capture, plus `book_snapshot`, include `"timestamp"` in epoch
+milliseconds. `_book` and `_book_snapshot` both assign it to the `OrderBook`. That assignment is dead
+code — `Feed.book_callback` (`cryptofeed/feed.py:242`) then executes an unconditional
+`book.timestamp = timestamp` from its own keyword argument, which `kraken_futures` never passes, so it
+is overwritten with `None`.
+
+This answers the question the downstream project needs settled: **the book feed does not differ from
+the ticker in what it delivers.** `Ticker` is constructed `timestamp=None` because `ticker_lite`
+genuinely carries no time field at all (its keys are bid/ask/change/premium/volume/tag/pair/dtm/
+maturityTime/volumeQuote/product_id/feed — confirmed against the capture). The book feed *has* the
+timestamp and loses it downstream. Both arrive as `None`. Consumers that need Kraken's book clock must
+read `book.raw['timestamp']` and normalize it themselves.
+
+This is library-wide, not Kraken-specific: 10 of the exchanges that call `book_callback` never pass
+`timestamp=` (`kraken`, `kraken_futures`, `kucoin`, `bitfinex`, `bitmex`, `dydx`, `gemini`,
+`blockchain`, `probit`, `bitflyer`), and the rest do. Changing it would alter `L2_BOOK` output for a
+third of the library. `tests/unit/test_kraken_futures.py::test_recorded_book_delta_exchange_timestamp_is_dropped`
+pins the behavior as it actually is, so the gap is documented rather than assumed.
