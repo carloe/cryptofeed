@@ -37,6 +37,8 @@ this fork's. To see only the fork's delta, diff against `fe5993b0`.
 | 2026-08-06 | `6b8b6a91` | `tests/unit/test_bybit.py` | [Pin the liquidation deltas to a recorded `allLiquidation` frame](#3-recorded-allliquidation-fixture). Test only, no behavior change. |
 | 2026-08-06 | `91320542` | `cryptofeed/exchanges/kraken_futures.py` | [Stop lowercasing the websocket `product_id` at the dispatch point](#4-kraken-futures-websocket-product_id-case-drift). Kraken's REST instruments endpoint now returns uppercase symbols, so the transform broke every inbound message. Includes a [known test consequence](#45-known-consequence-test_exchange_playbackkraken_futures-now-fails). |
 | 2026-08-06 | `2eb24a8a` | `tests/unit/test_kraken_futures.py` | Recorded-capture coverage for the above. New file, no upstream code touched. |
+| 2026-08-06 | `706a937c` | `cryptofeed/exchanges/kraken_futures.py` | [Pass the book's exchange timestamp to `book_callback`](#5-kraken-futures-book-exchange-timestamp) on both the snapshot and delta paths. `OrderBook.timestamp` was delivered as `None`; conforms the outlier to the library's majority contract. |
+| 2026-08-06 | `3c498d38` | `tests/unit/test_kraken_futures.py` | Recorded-capture coverage for both book paths, plus [the other exchanges reported but not changed](#53-the-rest-of-the-library-reported-not-changed). Test only. |
 
 ## Details
 
@@ -371,22 +373,158 @@ The inverse perpetuals and half the fixed-maturity contracts are therefore unrea
 symbol. Fixing it requires a normalization scheme that distinguishes the product types, which changes
 public symbol names — far outside this change.
 
-**The book feed's exchange timestamp is discarded.** Kraken's book frames *do* carry a real exchange
-clock: all 27249 `book` frames in the capture, plus `book_snapshot`, include `"timestamp"` in epoch
-milliseconds. `_book` and `_book_snapshot` both assign it to the `OrderBook`. That assignment is dead
-code — `Feed.book_callback` (`cryptofeed/feed.py:242`) then executes an unconditional
-`book.timestamp = timestamp` from its own keyword argument, which `kraken_futures` never passes, so it
-is overwritten with `None`.
+**The book feed's exchange timestamp is discarded.** — **Superseded by [section 5](#5-kraken-futures-book-exchange-timestamp),
+which fixes it. Left here for the record of what was found.** Kraken's book frames *do* carry a real
+exchange clock: all 27249 `book` frames in the capture, plus `book_snapshot`, include `"timestamp"` in
+epoch milliseconds. `_book` and `_book_snapshot` both assign it to the `OrderBook`. That assignment was
+dead code — `Feed.book_callback` (`cryptofeed/feed.py:242`) then executes an unconditional
+`book.timestamp = timestamp` from its own keyword argument, which `kraken_futures` did not pass, so it
+was overwritten with `None`.
 
-This answers the question the downstream project needs settled: **the book feed does not differ from
-the ticker in what it delivers.** `Ticker` is constructed `timestamp=None` because `ticker_lite`
-genuinely carries no time field at all (its keys are bid/ask/change/premium/volume/tag/pair/dtm/
-maturityTime/volumeQuote/product_id/feed — confirmed against the capture). The book feed *has* the
-timestamp and loses it downstream. Both arrive as `None`. Consumers that need Kraken's book clock must
-read `book.raw['timestamp']` and normalize it themselves.
+At the time this section was written the answer to the downstream question was that the book feed did
+*not* differ from the ticker in what it delivers — both arrived as `None`, for different reasons.
+`Ticker` is constructed `timestamp=None` because `ticker_lite` genuinely carries no time field at all
+(its keys are bid/ask/change/premium/volume/tag/pair/dtm/maturityTime/volumeQuote/product_id/feed —
+confirmed against the capture). The book feed *had* the timestamp and lost it downstream. **That is no
+longer true of the book feed as of section 5**; the `ticker_lite` half of the answer still stands.
 
-This is library-wide, not Kraken-specific: 10 of the exchanges that call `book_callback` never pass
-`timestamp=` (`kraken`, `kraken_futures`, `kucoin`, `bitfinex`, `bitmex`, `dydx`, `gemini`,
-`blockchain`, `probit`, `bitflyer`), and the rest do. Changing it would alter `L2_BOOK` output for a
-third of the library. `tests/unit/test_kraken_futures.py::test_recorded_book_delta_exchange_timestamp_is_dropped`
-pins the behavior as it actually is, so the gap is documented rather than assumed.
+### 5. Kraken Futures book exchange timestamp
+
+`OrderBook.timestamp` was delivered as `None` on every `L2_BOOK` callback, so consumers could not tell
+when the exchange actually produced a book update and had to fall back on local receipt time. The
+exchange timestamp was present on the wire and correctly parsed the whole time — it was thrown away one
+line later.
+
+Both book paths compute it and neither passed it on:
+
+```python
+self._l2_book[pair].timestamp = self.timestamp_normalize(msg["timestamp"]) if "timestamp" in msg else None
+
+await self.book_callback(L2_BOOK, self._l2_book[pair], timestamp, raw=msg, sequence_number=msg['seq'])
+```
+
+`Feed.book_callback` (`cryptofeed/feed.py:242`) then runs `book.timestamp = timestamp` unconditionally
+from its own keyword argument, which defaults to `None`. The assignment above it was therefore dead,
+and the `timestamp` passed positionally is the *receipt* time filling `receipt_timestamp`, not this.
+
+The fix adds `timestamp=self._l2_book[pair].timestamp` to both calls. Nothing is deleted and the two
+upstream computation lines are untouched — they simply become load-bearing again instead of dead. This
+is the same category as the [§1.2 side inversion](#12-behavior-change-side-mapping-inverted): conforming
+an outlier to the library's de facto majority contract, not inventing new behavior.
+
+#### 5.1 Both book paths, and both needed it
+
+`KrakenFutures` has exactly two `book_callback` call sites, one per websocket feed. Kraken sends a
+`book_snapshot` on subscribe and after any resync, then a `book` delta per change:
+
+| Path | Method | Feed | Call site | Passed `timestamp=` before | Changed |
+| --- | --- | --- | --- | --- | --- |
+| Snapshot | `_book_snapshot` | `book_snapshot` | line 175 | No | **Yes** |
+| Delta | `_book` | `book` | line 208 | No | **Yes** |
+
+There is no third path — no partial-book or REST-seeded variant, unlike `binance.py`, whose `_snapshot`
+is REST-seeded. Both were broken identically and both are fixed.
+
+Fixing only one would have been the realistic failure, since the two call sites are 33 lines apart and
+look different (one carries `delta=`, the other does not) — and four exchanges in this library
+demonstrably have exactly that bug already (see [5.3](#53-the-rest-of-the-library-reported-not-changed)).
+The two paths are therefore pinned by two separate tests, and each was mutation-checked on its own; see
+[5.2](#52-evidence).
+
+#### 5.2 Evidence
+
+Two recorded frames, captured off `wss://futures.kraken.com/ws/v1` on 2026-08-06, stored byte-for-byte
+as received and never re-serialized. Each is stored alongside the **local receipt time measured at the
+instant the frame arrived**, so the clock gaps quoted below are real measurements, not numbers chosen to
+make the assertions look strong.
+
+**Delta** — the widest-diverging frame in a 31435-frame capture:
+
+```
+{"feed":"book","product_id":"PF_XBTUSD","side":"buy","seq":17132345,"price":64382.0,"qty":7.8852,"timestamp":1786047745831}
+```
+
+Exchange clock `1786047745.831`, measured receipt `1786047745.95403` — **123ms apart**. Across that
+capture the divergence ran min −36ms, median −33ms, max +123ms, so this is the strongest discriminator
+the wire actually offered; a frame picked at random would separate the two clocks by roughly 33ms.
+
+**Snapshot** — a thin fixed-maturity contract whose book had not ticked for nearly six seconds:
+
+```
+{"feed":"book_snapshot","product_id":"FF_XBTUSD_260807","timestamp":1786047818552,"seq":140098,"tickSize":null,"bids":[...],"asks":[...]}
+```
+
+Exchange clock `1786047818.552`, measured receipt `1786047824.30581` — **5.754s apart**. `PF_XBTUSD`'s
+own snapshot was unusable as a fixture for two reasons: it is 93986 characters (1800 bids, 1281 asks),
+and its clocks sat only 30ms apart. Subscribing to an illiquid instrument produced a 341-character
+snapshot with a gap two orders of magnitude wider.
+
+The gaps are what make the fixtures load-bearing. A frame whose exchange timestamp and receipt time
+coincided would assert equally well against code that read `msg['timestamp']`, code that substituted the
+receipt time, and code that fabricated a plausible-looking value. These separate all three, and the
+tests assert the inequality explicitly (`> 5.0` and `> 0.1` seconds respectively) rather than only the
+equality.
+
+**Mutation.** Reverting the fix fails the tests — checked three ways, because "fixed one path, missed
+the other" is the failure mode that matters here:
+
+| Mutation | Result |
+| --- | --- |
+| Revert both call sites (upstream state) | `2 failed, 5 passed` — both timestamp tests |
+| Revert **only** line 175 (snapshot), delta left fixed | `1 failed, 6 passed` — snapshot test only |
+| Revert **only** line 208 (delta), snapshot left fixed | `1 failed, 6 passed` — delta test only |
+
+```
+>       assert book.timestamp == 1786047745.831
+E       assert None == 1786047745.831
+E        +  where None = exchange: KRAKEN_FUTURES symbol: BTC-USD-PERP ... timestamp: None.timestamp
+```
+
+Each path fails independently and only its own test, so neither test is carrying the other. The parser
+was restored immediately after each mutation.
+
+**Live.** Confirmed against all three venues the downstream project consumes, same run, after the fix:
+
+```
+BINANCE_FUTURES  book.timestamp = 1786048037.884   raw['E']         = 1786048037884
+BYBIT            book.timestamp = 1786048036.128   raw['ts']        = 1786048036128
+KRAKEN_FUTURES   book.timestamp = 1786048036.99    raw['timestamp'] = 1786048036990
+```
+
+Kraken previously delivered `None` here. All three now deliver the exchange's own clock as normalized
+float seconds, so `book.timestamp` is directly comparable across the three venues.
+
+#### 5.3 The rest of the library: reported, not changed
+
+Scope is `KRAKEN_FUTURES` only — this fork maintains what `litquid` uses. The same defect exists
+elsewhere and is deliberately left alone; recorded here so anyone who later depends on one of these
+knows before trusting `book.timestamp`. Counted by AST over every `book_callback` call site in
+`cryptofeed/exchanges/`, not by grep, so multi-line calls are included.
+
+Of 32 files that call `book_callback`, 18 always pass `timestamp=`, 10 never do, and 4 pass it on one
+path but not the other.
+
+**Never pass it — `book.timestamp` is always `None`** (9 remaining after this change):
+
+`bitfinex.py`, `bitflyer.py`, `bitmex.py`, `blockchain.py`, `dydx.py`, `gemini.py`, `kraken.py`,
+`kucoin.py`, `probit.py`
+
+**Split between paths — `book.timestamp` is populated on some callbacks and `None` on others**, which
+is the more dangerous shape because it looks like it works until it intermittently does not:
+
+| File | Passes | Drops |
+| --- | --- | --- |
+| `coinbase.py` | line 148 | line 130 |
+| `gateio.py` | line 193 | line 131 |
+| `gateio_futures.py` | line 236 | line 174 |
+| `independent_reserve.py` | line 184 | line 207 |
+
+`kraken.py` (spot) is the notable omission from this change: it is the sibling of the exchange fixed
+here and has the same defect on both its call sites (lines 134 and 161). It is untouched because
+`litquid` does not consume Kraken spot. Fixing it would be a two-line change of the same shape if that
+ever changes.
+
+Consumers of any exchange in either list must read the exchange clock off `book.raw` and normalize it
+themselves. The key differs per exchange — `'timestamp'` for Kraken Futures, `'E'` for Binance, `'ts'`
+for Bybit — and the raw values are unnormalized integer milliseconds, so a fallback written as
+`book.timestamp or book.raw.get(...)` would silently mix seconds and milliseconds.
