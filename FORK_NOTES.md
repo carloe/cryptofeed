@@ -39,6 +39,8 @@ this fork's. To see only the fork's delta, diff against `fe5993b0`.
 | 2026-08-06 | `2eb24a8a` | `tests/unit/test_kraken_futures.py` | Recorded-capture coverage for the above. New file, no upstream code touched. |
 | 2026-08-06 | `706a937c` | `cryptofeed/exchanges/kraken_futures.py` | [Pass the book's exchange timestamp to `book_callback`](#5-kraken-futures-book-exchange-timestamp) on both the snapshot and delta paths. `OrderBook.timestamp` was delivered as `None`; conforms the outlier to the library's majority contract. |
 | 2026-08-06 | `3c498d38` | `tests/unit/test_kraken_futures.py` | Recorded-capture coverage for both book paths, plus [the other exchanges reported but not changed](#53-the-rest-of-the-library-reported-not-changed). Test only. |
+| 2026-08-06 | `ce382cba` | `cryptofeed/exchanges/kraken_futures.py` | One comment per book call site noting the positional argument is receipt time and the `timestamp=` kwarg is the exchange clock. [Comment only](#5-kraken-futures-book-exchange-timestamp), no behavior change. |
+| 2026-08-06 | `4d164b86` | `tests/unit/test_exchange.py` | [Mark the `KRAKEN_FUTURES` playback case `xfail(strict=True)`](#6-the-kraken_futures-playback-case-is-now-xfailstrict). Restores the 42-failure baseline; only that one parameter is wrapped, the test body is untouched. |
 
 ## Details
 
@@ -353,6 +355,10 @@ the stale test green precisely by masking the class of drift this fork exists to
 Aside from this one test, the fix introduces no other change in suite results — the before/after failure
 sets are otherwise identical.
 
+**Update:** it is no longer a bare failure. As of [section 6](#6-the-kraken_futures-playback-case-is-now-xfailstrict)
+it carries `xfail(strict=True)`, which restores the suite baseline to its original 42 failures while
+keeping the condition asserted rather than ignored.
+
 #### 4.6 Unrelated findings, reported but not changed
 
 Two pre-existing upstream defects were found while gathering the evidence above. Neither is touched.
@@ -411,6 +417,12 @@ The fix adds `timestamp=self._l2_book[pair].timestamp` to both calls. Nothing is
 upstream computation lines are untouched — they simply become load-bearing again instead of dead. This
 is the same category as the [§1.2 side inversion](#12-behavior-change-side-mapping-inverted): conforming
 an outlier to the library's de facto majority contract, not inventing new behavior.
+
+Each call site carries a one-line comment saying the positional argument is the receipt time and the
+kwarg is Kraken's own clock. Both now read `book_callback(L2_BOOK, book, timestamp, timestamp=...)`,
+which scans as a duplicate argument and would otherwise be a standing invitation to "clean up". Same
+standard as the do-not-revert comment on the [§1.2](#12-behavior-change-side-mapping-inverted) side
+inversion: a line that looks wrong and is right gets a comment saying so.
 
 #### 5.1 Both book paths, and both needed it
 
@@ -528,3 +540,94 @@ Consumers of any exchange in either list must read the exchange clock off `book.
 themselves. The key differs per exchange — `'timestamp'` for Kraken Futures, `'E'` for Binance, `'ts'`
 for Bybit — and the raw values are unnormalized integer milliseconds, so a fallback written as
 `book.timestamp or book.raw.get(...)` would silently mix seconds and milliseconds.
+
+### 6. The `KRAKEN_FUTURES` playback case is now `xfail(strict)`
+
+[Section 4.5](#45-known-consequence-test_exchange_playbackkraken_futures-now-fails) explains why
+`tests/unit/test_exchange.py::test_exchange_playback[KRAKEN_FUTURES]` cannot pass: its `sample_data`
+fixture seeds the symbol map from a 2021 REST response carrying **lowercase** symbols, then replays
+websocket frames carrying **uppercase** `product_id`s. That pairing resolves only if the code lowercases
+the wire value, which is exactly the drift [section 4](#4-kraken-futures-websocket-product_id-case-drift)
+removed. It fails on `FI_BCHUSD_210730`, a fixed-maturity contract that expired on 2021-07-30.
+
+It now carries `pytest.mark.xfail(strict=True)` on that one parameter. Only the `KRAKEN_FUTURES` entry
+in the existing `parametrize` list is wrapped in `pytest.param(...)`; every other exchange is passed
+through unchanged, and the test body is not touched.
+
+**Why strict.** A plain `xfail` would silently swallow a later pass, which is the failure mode that
+matters here — the marker would outlive the condition it documents and quietly assert nothing. Under
+`strict=True` the marker is itself an assertion: if the fixtures are ever re-recorded against the
+current API, the case starts passing, `XPASS(strict)` fails the suite, and whoever did the re-recording
+is told to delete the marker. Verified by restoring `.lower()`, which makes the case replay again:
+
+```
+tests/unit/test_exchange.py::test_exchange_playback[KRAKEN_FUTURES] FAILED
+[XPASS(strict)] 2021 fixture pins the pre-drift lowercase REST symbols, see FORK_NOTES 4.5
+```
+
+The parser was restored immediately.
+
+**What was not done, and why.** `sample_data` was not re-recorded — that is a large delta to upstream
+test assets and would mean authoring a new upstream fixture, including rewriting the `lookup_table`
+callback counts. The symbol lookup was not made case-insensitive — that would turn the case green
+precisely by masking the class of drift this fork exists to catch, which is the worse outcome of the
+two even though it is the smaller diff.
+
+**Effect on the baseline.** The unit suite returns to **42 pre-existing failures**, the count from
+before [section 4](#4-kraken-futures-websocket-product_id-case-drift), and the failure set is otherwise
+byte-identical to that baseline — verified by diffing the sorted `FAILED` lines, not by comparing
+totals. The 42 are upstream staleness in `test_symbol_normalization` (39, live REST calls) and
+`test_exchange_playback` (3: `BIT.COM`, `BYBIT`, `COINBASE`). None are touched.
+
+### 7. `order_book` 0.7.0 build gate
+
+Report only. No fork change follows from this and none was made; recorded because the downstream
+project's Python 3.13 decision was verified against `order_book` 0.6.1 and a clean install from this
+fork now resolves 0.7.0. `pyproject.toml` pins `order_book>=0.6.0` and was **not** modified.
+
+**Result: PASS**, on all four checks.
+
+| Check | Result |
+| --- | --- |
+| Clean venv resolves | `order-book==0.7.0` on Python 3.13.12 |
+| Builds from sdist | Yes — `uv pip install --no-binary order-book` → `Built order-book==0.7.0` |
+| Imports on 3.13 | Yes — `order_book.cpython-313-darwin.so`, macOS 26.5.2 arm64 |
+| bid/ask roundtrip | Yes — see below |
+
+```
+best bid         : (Decimal('64401.0'), Decimal('0.1239'))
+best ask         : (Decimal('64402.0'), Decimal('0.1179'))
+after update, bid 64401 : 7.8852
+after delete, best ask  : (Decimal('64416.0'), Decimal('0.0568'))
+sorted bid keys         : [Decimal('64401.0'), Decimal('64400.0'), Decimal('64399.0')]
+value type roundtrip    : Decimal == Decimal('7.8852')
+```
+
+Insert, keyed lookup, in-place update, delete, descending/ascending ordering and `SortedDict(ordering=
+'DESC')` all behave, and `Decimal` survives the C boundary in both directions rather than degrading to
+`float` — which matters because every cryptofeed parser feeds `Decimal` prices and sizes into the book.
+
+**One premise correction.** The gate was framed on the assumption that `order_book` publishes no cp313
+or macOS ARM64 wheels and so builds from sdist every time. That is no longer true at 0.7.0, which
+publishes six wheels:
+
+```
+order_book-0.7.0-cp312-cp312-macosx_11_0_arm64.whl
+order_book-0.7.0-cp312-cp312-manylinux2014_x86_64...whl
+order_book-0.7.0-cp313-cp313-macosx_11_0_arm64.whl
+order_book-0.7.0-cp313-cp313-manylinux2014_x86_64...whl
+order_book-0.7.0-cp314-cp314-macosx_26_0_arm64.whl
+order_book-0.7.0-cp314-cp314-manylinux2014_x86_64...whl
+order_book-0.7.0.tar.gz
+```
+
+A default `uv`/`pip` install on cp313 macOS ARM64 or manylinux x86-64 therefore takes the **wheel** and
+compiles nothing — confirmed: a clean venv install pulled the wheel without a build step. The sdist path
+above was forced with `--no-binary` specifically to test the case the gate was worried about. Both paths
+work, so the concern is resolved from both directions; note only that cp314 macOS wheels are built
+against `macosx_26_0`, so a cp314 install on an older macOS falls back to sdist.
+
+Additionally verified end to end rather than in isolation: this fork installed clean into a fresh 3.13
+venv against the sdist-built 0.7.0 (`cryptofeed 2.4.1`, `order-book 0.7.0`), imported, and ran its
+Kraken Futures suite — `7 passed`. So the fork's Cython `types.pyx` `OrderBook` works against 0.7.0, not
+just the extension in isolation.
