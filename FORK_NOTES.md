@@ -2,7 +2,12 @@
 
 `carloe/cryptofeed` is a maintenance fork of [bmoscon/cryptofeed](https://github.com/bmoscon/cryptofeed).
 
-Upstream was archived (read-only) on 2026-07-08 at `v2.4.1` and will never receive fixes again.
+Upstream was archived (read-only) on 2026-07-08 and will never receive fixes again. It was archived
+with `master` ahead of its last release: `v2.4.1` was tagged and published to PyPI on 2025-02-08, and
+`master` then ran on for nine further commits over roughly a year, up to `fe5993b0` on 2026-01-31,
+without another release ever being cut. This fork is taken from that unreleased `master`, not from
+the `v2.4.1` release.
+
 This fork exists for one purpose: to keep the exchange integrations consumed by the downstream
 `litquid` project working, as a pinned git dependency. It is not an adoption of the library, and no
 attempt is made to maintain the parts of cryptofeed that `litquid` does not use.
@@ -11,6 +16,15 @@ Every change here is a deliberate, minimal delta against upstream. Upstream code
 reformatted, or modernized. See `CLAUDE.md` for the full working rules.
 
 **Fork point:** `fe5993b0`, identical to upstream `master` at the time of forking.
+
+**On the `v2.4.1-litquid.N` tag scheme:** the `v2.4.1` part is a naming convention only. It anchors
+on the last upstream *release* because that is the only version number upstream ever published, and
+because `pyproject.toml` still declares `version = "2.4.1"`. It is **not** a claim that the fork
+point equals that release. Nine upstream commits, spanning 2025-02-08 to 2026-01-31, sit between
+`v2.4.1` and the fork point — including the `setup.py`-to-`pyproject.toml` packaging migration
+(see [section 2.1](#21-the-defect-is-inherited-not-introduced-here)). Anyone diffing this fork
+against PyPI's `cryptofeed 2.4.1` will see those commits too, and they are upstream's work, not
+this fork's. To see only the fork's delta, diff against `fe5993b0`.
 
 ## Patch log
 
