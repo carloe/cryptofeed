@@ -172,7 +172,7 @@ class KrakenFutures(Feed):
 
         self._l2_book[pair].timestamp = self.timestamp_normalize(msg["timestamp"]) if "timestamp" in msg else None
 
-        await self.book_callback(L2_BOOK, self._l2_book[pair], timestamp, raw=msg, sequence_number=msg['seq'])
+        await self.book_callback(L2_BOOK, self._l2_book[pair], timestamp, timestamp=self._l2_book[pair].timestamp, raw=msg, sequence_number=msg['seq'])
 
     async def _book(self, msg: dict, pair: str, timestamp: float):
         """
@@ -205,7 +205,7 @@ class KrakenFutures(Feed):
 
         self._l2_book[pair].timestamp = self.timestamp_normalize(msg["timestamp"]) if "timestamp" in msg else None
 
-        await self.book_callback(L2_BOOK, self._l2_book[pair], timestamp, delta=delta, sequence_number=msg['seq'], raw=msg)
+        await self.book_callback(L2_BOOK, self._l2_book[pair], timestamp, timestamp=self._l2_book[pair].timestamp, delta=delta, sequence_number=msg['seq'], raw=msg)
 
     async def _funding(self, msg: dict, pair: str, timestamp: float):
         if 'funding_rate' in msg:
