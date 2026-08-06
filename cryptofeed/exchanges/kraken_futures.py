@@ -246,8 +246,8 @@ class KrakenFutures(Feed):
             else:
                 LOG.warning("%s: Invalid message type %s", self.id, msg)
         else:
-            # As per Kraken support: websocket product_id is uppercase version of the REST API symbols
-            pair = self.exchange_symbol_to_std_symbol(msg['product_id'].lower())
+            # Websocket product_id matches the REST API symbol verbatim (both uppercase, e.g. PF_XBTUSD)
+            pair = self.exchange_symbol_to_std_symbol(msg['product_id'])
             if msg['feed'] == 'trade':
                 await self._trade(msg, pair, timestamp)
             elif msg['feed'] == 'trade_snapshot':
