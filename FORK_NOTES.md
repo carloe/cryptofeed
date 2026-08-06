@@ -34,6 +34,7 @@ this fork's. To see only the fork's delta, diff against `fe5993b0`.
 | 2026-08-04 | `79b70972` | `cryptofeed/exchanges/bybit.py` | [Migrate `LIQUIDATIONS` to the `allLiquidation` topic](#1-bybit-liquidations-allliquidation-migration). Includes two deliberate behavior changes: [timestamp units](#11-behavior-change-timestamp-units) and [side mapping](#12-behavior-change-side-mapping-inverted), plus a [minor `raw` scope change](#13-minor-raw-payload-scope). |
 | 2026-08-04 | `111e3955` | `tests/unit/test_bybit.py`, `examples/demo_bybit_all_liquidation.py` | Test coverage and a live smoke script for the above. New files, no upstream code touched. |
 | 2026-08-04 | `ab6d776c` | `pyproject.toml` | [Ship the `cryptofeed` subpackages in source builds](#2-packaging-subpackages-excluded-from-source-builds). Inherited upstream defect; the only change to a build file, made under [strict necessity](#22-why-a-build-file-was-touched). |
+| 2026-08-06 | `6b8b6a91` | `tests/unit/test_bybit.py` | [Pin the liquidation deltas to a recorded `allLiquidation` frame](#3-recorded-allliquidation-fixture). Test only, no behavior change. |
 
 ## Details
 
@@ -192,3 +193,30 @@ The `[build-system] requires` pin is the unversioned `"setuptools"`, so under PE
 is satisfied automatically. Only a deliberate `--no-build-isolation` build against a pre-77 setuptools in
 the ambient environment will fail. The `requires` pin is left alone rather than tightened, per minimal-delta
 discipline; this note exists so the failure mode is recognizable if anyone hits it.
+
+### 3. Recorded `allLiquidation` fixture
+
+Sections [1.1](#11-behavior-change-timestamp-units) and [1.2](#12-behavior-change-side-mapping-inverted)
+are the fork's two deliberate, downstream-visible deltas against upstream. Until now they were argued from
+Bybit's documentation and pinned by fixtures hand-written from that same documentation — the tests and the
+reasoning shared a single source, so neither could catch a misreading of it.
+
+`tests/unit/test_bybit.py::test_liquidation_recorded_frame` closes that loop with a real frame, recorded off
+the Bybit linear websocket on 2026-08-05, captured before parsing and never re-serialized. It is stored as
+the raw string exactly as received and fed through `message_handler`, so routing and deserialization run as
+they did live. It is the only fixture in the file that is evidence rather than interpretation, and it is
+commented as such to keep it distinguishable from the doc-derived ones beside it.
+
+The frame is useful specifically because its two clocks disagree: the event's own `T` is `1785905986808`
+and the batch envelope `ts` is `1785905987246`, 438ms apart. A frame where they matched would parse
+identically whether the code read the right field or the wrong one. The test asserts the full parsed
+surface — symbol, side, quantity, price, timestamp — and both deltas are load-bearing in it: `S` is `Buy`,
+so a long was liquidated, and the assertion is `SELL`.
+
+Both assertions were confirmed to bite by mutating the parser and observing the failure: reverting the side
+mapping to upstream's verbatim form fails it, and sourcing the timestamp from the envelope `ts` fails it.
+The parser was restored immediately; no upstream source file was modified by this change.
+
+The capture came from a 30-minute live run by the downstream `litquid` collector on 2026-08-05, which
+recorded 35 `allLiquidation` events across 55 symbols, all of which reconciled to correctly parsed rows.
+One representative frame is vendored here; the fork does not carry the capture set.
