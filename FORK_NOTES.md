@@ -41,6 +41,8 @@ this fork's. To see only the fork's delta, diff against `fe5993b0`.
 | 2026-08-06 | `3c498d38` | `tests/unit/test_kraken_futures.py` | Recorded-capture coverage for both book paths, plus [the other exchanges reported but not changed](#53-the-rest-of-the-library-reported-not-changed). Test only. |
 | 2026-08-06 | `ce382cba` | `cryptofeed/exchanges/kraken_futures.py` | One comment per book call site noting the positional argument is receipt time and the `timestamp=` kwarg is the exchange clock. [Comment only](#5-kraken-futures-book-exchange-timestamp), no behavior change. |
 | 2026-08-06 | `4d164b86` | `tests/unit/test_exchange.py` | [Mark the `KRAKEN_FUTURES` playback case `xfail(strict=True)`](#6-the-kraken_futures-playback-case-is-now-xfailstrict). Restores the 42-failure baseline; only that one parameter is wrapped, the test body is untouched. |
+| 2026-08-08 | `84bf6280` | `cryptofeed/exchanges/binance.py`, `cryptofeed/exchanges/binance_futures.py` | [Route USD-M futures streams to their required websocket base path](#8-binance-usd-m-futures-websocket-base-path-split). Binance decommissioned the legacy root on 2026-04-23; trades, liquidations, funding and candles were silently receiving nothing. Confined to futures by data - the [other four venues are byte-identical](#83-blast-radius-shared-code-confined-behavior). |
+| 2026-08-08 | `4eaca29f` | `tests/unit/test_binance_futures.py` | Path-selection tests plus recorded-capture coverage for each recovered stream. New file, no upstream code touched. |
 
 ## Details
 
@@ -631,3 +633,157 @@ Additionally verified end to end rather than in isolation: this fork installed c
 venv against the sdist-built 0.7.0 (`cryptofeed 2.4.1`, `order-book 0.7.0`), imported, and ran its
 Kraken Futures suite — `7 passed`. So the fork's Cython `types.pyx` `OrderBook` works against 0.7.0, not
 just the extension in isolation.
+
+### 8. Binance USD-M futures websocket base path split
+
+Binance split the USD-M futures websocket into three purpose-specific base paths — `/public`,
+`/market` and `/private` — and **permanently decommissioned the legacy root on 2026-04-23**.
+
+The critical property, and the reason this went unnoticed: **the stream names did not change. The base
+path is what now selects which streams a connection may receive.** `btcusdt@aggTrade` is still spelled
+`btcusdt@aggTrade`; it simply no longer delivers anything unless you asked for it under `/market`.
+
+Docs: <https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Important-WebSocket-Change-Notice>
+
+> After the upgrade, any connections not migrated will ONLY be able to receive data from
+> `wss://fstream.binance.com/public`. Channels under `/market` and `/private` will stop pushing data.
+
+The fork built every subscription on the bare root, so it was an unmigrated connection: it kept
+receiving the `/public` streams and silently received nothing for everything else.
+
+#### 8.1 Why it was invisible at every layer above
+
+The legacy root does not reject an unmigrated connection. It accepts the TCP connect, completes the
+websocket handshake, accepts the combined-stream URL including the `/market` stream names, returns no
+error frame, does not close, and then simply never sends those streams. Meanwhile the `/public` streams
+on the same connection keep flowing normally.
+
+Every signal a consumer could reasonably monitor therefore looks healthy:
+
+- the connection is up, so no reconnect loop and no connection alarm
+- `bookTicker` and `depth` keep arriving, so the feed is demonstrably "working" and traffic volume
+  stays high — this is what makes it worse than an outright outage
+- no exception is raised anywhere, so `log_message_on_error` and the exception handler see nothing
+- cryptofeed's `message_handler` routes on `msg['stream']`, and a stream that never arrives is not an
+  unknown message — there is no "unexpected message" warning to log
+
+The failure is indistinguishable from a genuinely quiet market unless you know the expected rate of a
+specific channel. Liquidations in particular are sparse and bursty by nature, so zero liquidations for
+an hour is not obviously wrong. The downstream consumer lost Binance liquidations outright and the only
+symptom was an absence.
+
+Reproduced end to end. The same live smoke, same 60 symbols, same channel set, run against the legacy
+root (90s) and against the fix (180s):
+
+| Channel | Stream | Legacy root | Fixed |
+| --- | --- | --- | --- |
+| TRADES | `aggTrade` | **0** | 4667 |
+| LIQUIDATIONS | `forceOrder` | **0** | 1 |
+| FUNDING | `markPrice` | **0** | 3600 |
+| CANDLES | `kline_1m` | **0** | 180 |
+| TICKER | `bookTicker` | 34452 | 71147 |
+| L2_BOOK | `depth` | 18820 | 39442 |
+| OPEN_INTEREST | REST poll | 234 | 432 |
+
+Four channels at exactly zero, with no error, no disconnect, and two other channels streaming tens of
+thousands of messages beside them.
+
+#### 8.2 Channel to base path mapping
+
+Every row was verified twice: against Binance's current documentation, and against a live frame
+captured on 2026-08-08 on the path in question. Counts are frames received in a single 30s window with
+all six streams on one combined connection per path.
+
+| cryptofeed channel | Stream built | Path | Live on legacy root | Live on `/market` |
+| --- | --- | --- | --- | --- |
+| `TRADES` | `<sym>@aggTrade` | `/market` | 0 | 62 |
+| `FUNDING` | `<sym>@markPrice` | `/market` | 0 | 10 |
+| `CANDLES` | `<sym>@kline_<interval>` | `/market` | 0 | 45 |
+| `LIQUIDATIONS` | `<sym>@forceOrder` | `/market` | 0 | see below |
+| `TICKER` | `<sym>@bookTicker` | `/public` | 3858 | 0 |
+| `L2_BOOK` | `<sym>@depth@<interval>` | `/public` | 293 | 0 |
+| `OPEN_INTEREST` | — | n/a | REST poll on `fapi`, not a websocket stream |
+
+Note the mapping is not "everything moved" — `bookTicker` and `depth` return **zero** on `/market`. A
+blanket switch of the base path would have restored trades and liquidations while silently killing the
+order book and ticker, converting one outage into another. Per-channel selection is required.
+
+**`FUNDING` is markPrice-derived, confirmed in code and on the wire.**
+`BinanceFutures.websocket_channels[FUNDING]` is `'markPrice'`, and `Binance.message_handler` routes
+`msg['e'] == 'markPriceUpdate'` to `_funding`. There is no separate funding stream. So funding lives on
+`/market` and died with trades and candles, which is not obvious from the channel name.
+
+**`LIQUIDATIONS` needed its own check.** The per-symbol `<sym>@forceOrder` stream — which is what
+cryptofeed builds, *not* the market-wide `!forceOrder@arr` — is sparse enough that a short window
+proves nothing. Two runs settled it:
+
+- 200s, 6 major symbols: 0 per-symbol events on every path, but `!forceOrder@arr` returned 37 on
+  `/market` and 0 on the legacy root in the same concurrent window. Conclusive for the array form,
+  inconclusive for per-symbol.
+- 260s, 10 symbols, `!forceOrder@arr` and per-symbol on the same connection: the array reported 3
+  liquidations for watched symbols and the per-symbol streams reported exactly those same 3, 1:1. So
+  per-symbol `forceOrder` is **alive** on `/market` — the earlier zero was a quiet window, not death.
+- 240s, 120 perpetuals, legacy root and `/market` concurrently: **0** events on the legacy root, **6**
+  on `/market`, including `btcusdt@forceOrder`.
+
+No change to the liquidation stream name was needed; it was purely a path problem.
+
+#### 8.3 Blast radius: shared code, confined behavior
+
+`_address()` is defined **once**, on `Binance` (`cryptofeed/exchanges/binance.py:91`), and inherited
+unmodified by all five venues in the family — `BINANCE`, `BINANCE_FUTURES`, `BINANCE_DELIVERY`,
+`BINANCE_US`, `BINANCE_TR`. No subclass overrides it. So the change could not be made in
+`binance_futures.py` alone without duplicating the whole method.
+
+It is confined by **data rather than by branching**. `Binance` gains an empty class attribute
+`stream_base_paths = {}`; `_address()` groups the streams it builds by
+`stream_base_paths.get(normalized_chan, '')` and emits one address per group. Only `BinanceFutures`
+populates the map. Every other venue looks up an empty dict, gets `''`, and produces exactly the URL it
+produced before.
+
+Verified by dumping every venue's built addresses before and after the change under a pinned
+`PYTHONHASHSEED` (the stream order within a URL varies per process otherwise, which would have made a
+naive diff look like a change). The complete diff across all five venues:
+
+```
+15c15,16
+<   "wss://fstream.binance.com/stream?streams=btcusdt@depth@100ms/btcusdt@markPrice/btcusdt@bookTicker/btcusdt@kline_1m/btcusdt@forceOrder/btcusdt@aggTrade"
+---
+>   "wss://fstream.binance.com/market/stream?streams=btcusdt@markPrice/btcusdt@kline_1m/btcusdt@forceOrder/btcusdt@aggTrade",
+>   "wss://fstream.binance.com/public/stream?streams=btcusdt@depth@100ms/btcusdt@bookTicker"
+```
+
+`BINANCE`, `BINANCE_US`, `BINANCE_TR` and `BINANCE_DELIVERY` are byte-identical.
+
+**COIN-M (`BINANCE_DELIVERY`) is genuinely unaffected, not merely untouched.** Probed live on
+2026-08-08: `wss://dstream.binance.com` (the legacy root) still delivers every stream —
+`btcusd_perp@aggTrade`, `@markPrice`, `@kline_1m`, `@bookTicker` and `@depth@100ms` all returned frames
+in a 25s window. The split is USD-M only. Had COIN-M been changed to match, it would have broken a
+working feed.
+
+#### 8.4 Consequence: futures now opens two connections
+
+A subscription spanning both paths can no longer share one websocket, so `_address()` returns a list
+and `Feed.connect` opens one connection per address. This is not new machinery — `_address()` already
+returned a list when the stream count exceeded `per_connection_limit`, and `connect()` already handled
+it (`cryptofeed/feed.py:210`). What changes is that multiple connections become the normal case for
+futures rather than a rarity at 1024+ streams.
+
+One knock-on worth recording. `Binance.subscribe()` calls `self._reset()`, which clears `_l2_book` and
+`last_update_id` for **all** pairs. With two connections, a reconnect on the `/market` connection resets
+the book state owned by the `/public` connection. This self-heals rather than corrupting: `_book()`
+re-fetches a REST snapshot when a pair is missing (`binance.py:317`), so the cost is an extra snapshot
+fetch, not a wrong book. The behavior is pre-existing and is left alone under minimal-delta discipline;
+it is noted here because this change makes it reachable in ordinary operation.
+
+#### 8.5 Not changed: the authenticated `/private` path
+
+`_address()` still builds authenticated connections as `<root>/ws/<listenKey>`, which per the same
+notice should now be `/private`. This is **not** fixed here, for two reasons: `litquid` consumes only
+public market data, and verifying it requires live API credentials that were not available, so any
+change would have been unverified. Anyone using `BinanceFutures` with `BALANCES`, `ORDER_INFO` or
+`POSITIONS` should expect the user-data stream to be affected and should test before relying on it.
+
+Likewise `!markPrice@arr`, `miniTicker`, `ticker`, `continuousKline`, `compositeIndex`, `contractInfo`
+and `assetIndex` are documented as `/market` streams but are not channels this fork's `BinanceFutures`
+subscribes, so no mapping entry exists for them.
