@@ -11,7 +11,7 @@ from typing import Tuple, Dict
 from yapic import json
 
 from cryptofeed.connection import AsyncConnection, HTTPPoll, RestEndpoint, Routes, WebsocketEndpoint
-from cryptofeed.defines import BALANCES, BINANCE_FUTURES, BUY, FUNDING, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, POSITIONS, SELL
+from cryptofeed.defines import BALANCES, BINANCE_FUTURES, BUY, CANDLES, FUNDING, L2_BOOK, LIMIT, LIQUIDATIONS, MARKET, OPEN_INTEREST, ORDER_INFO, POSITIONS, SELL, TICKER, TRADES
 from cryptofeed.exchanges.binance import Binance
 from cryptofeed.exchanges.mixins.binance_rest import BinanceFuturesRestMixin
 from cryptofeed.types import Balance, OpenInterest, OrderInfo, Position
@@ -32,6 +32,20 @@ class BinanceFutures(Binance, BinanceFuturesRestMixin):
         OPEN_INTEREST: 'open_interest',
         LIQUIDATIONS: 'forceOrder',
         POSITIONS: POSITIONS
+    }
+    # Binance split the USD-M futures websocket into per purpose base paths and
+    # decommissioned the legacy root on 2026-04-23. The stream NAMES are unchanged - the
+    # base path is what now selects which streams a connection may receive. An unmigrated
+    # connection still opens and still receives the /public streams, and silently receives
+    # nothing at all for the rest, with no error frame and no close.
+    # https://developers.binance.com/docs/derivatives/usds-margined-futures/websocket-market-streams/Important-WebSocket-Change-Notice
+    stream_base_paths = {
+        L2_BOOK: '/public',
+        TICKER: '/public',
+        TRADES: '/market',
+        CANDLES: '/market',
+        FUNDING: '/market',
+        LIQUIDATIONS: '/market',
     }
 
     @classmethod

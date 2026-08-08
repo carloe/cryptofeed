@@ -46,6 +46,10 @@ class Binance(Feed, BinanceRestMixin):
     }
     request_limit = 20
     per_connection_limit = 1024
+    # Base path prefix per normalized channel, inserted into the websocket address. An
+    # absent or empty entry keeps the address on the root, which is correct for every
+    # Binance venue except USD-M futures - see BinanceFutures.stream_base_paths.
+    stream_base_paths = {}
 
     @classmethod
     def timestamp_normalize(cls, ts: float) -> float:
@@ -104,8 +108,7 @@ class Binance(Feed, BinanceRestMixin):
             address += '/ws/' + listen_key
         else:
             address = self.address
-            address += '/stream?streams='
-        subs = []
+        subs = defaultdict(list)
 
         is_any_private = any(self.is_authenticated_channel(chan) for chan in self.subscription)
         is_any_public = any(not self.is_authenticated_channel(chan) for chan in self.subscription)
@@ -127,6 +130,10 @@ class Binance(Feed, BinanceRestMixin):
             elif normalized_chan == L2_BOOK:
                 stream = f"{chan}@{self.depth_interval}"
 
+            # streams served off different base paths cannot share a connection, so they
+            # are grouped here and get one address each below
+            base_path = self.stream_base_paths.get(normalized_chan, '')
+
             for pair in self.subscription[chan]:
                 # for everything but premium index the symbols need to be lowercase.
                 if pair.startswith("p"):
@@ -134,16 +141,21 @@ class Binance(Feed, BinanceRestMixin):
                         raise ValueError("Premium Index Symbols only allowed on Candle data feed")
                 else:
                     pair = pair.lower()
-                subs.append(f"{pair}@{stream}")
+                subs[base_path].append(f"{pair}@{stream}")
 
-        if 0 < len(subs) < self.per_connection_limit:
-            return address + '/'.join(subs)
-        else:
-            def split_list(_list: list, n: int):
-                for i in range(0, len(_list), n):
-                    yield _list[i:i + n]
+        def split_list(_list: list, n: int):
+            for i in range(0, len(_list), n):
+                yield _list[i:i + n]
 
-            return [address + '/'.join(chunk) for chunk in split_list(subs, self.per_connection_limit)]
+        addresses = []
+        for base_path, streams in subs.items():
+            prefix = address + base_path + '/stream?streams='
+            if 0 < len(streams) < self.per_connection_limit:
+                addresses.append(prefix + '/'.join(streams))
+            else:
+                addresses.extend(prefix + '/'.join(chunk) for chunk in split_list(streams, self.per_connection_limit))
+
+        return addresses[0] if len(addresses) == 1 else addresses
 
     def _reset(self):
         self._l2_book = {}
